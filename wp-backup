@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# Defaults (can be overridden by env, then overridden by CLI flags)
+###############################################################################
+
+: "${WPCLI:=/usr/local/bin/wp}"          # Path to wp-cli
+: "${WP_SUBDIR:=wp}"                     # WP directory inside docroot; "" means directly in docroot
+: "${BACKUP_RETENTION_DAYS:=180}"        # Keep .tar.gz backups for N days
+: "${DATE_FORMAT:=%Y%m%d}"               # Format for backup names
+: "${TAR_BIN:=/usr/bin/tar}"             # Path to tar
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] DOCROOT BACKUP_DIR
+
+Options:
+  -w PATH    Path to wp cli executable (default: $WPCLI)
+  -s NAME    WordPress subdirectory under DOCROOT (default: $WP_SUBDIR)
+  -r DAYS    Retention in days for .tar.gz backups (default: $BACKUP_RETENTION_DAYS)
+  -d FMT     Date format passed to "date +FMT" (default: $DATE_FORMAT)
+  -t PATH    Path to tar binary (default: $TAR_BIN)
+  -h         Show this help and exit
+
+Examples:
+  wp-backup /var/www/html/site /var/backups/site
+  wp-backup -s "" /var/www/html/site /var/backups/site     # WP in docroot
+  wp-backup -w /opt/wp-cli/wp -r 365 /var/www/html/site /var/backups/site
+EOF
+}
+
+###############################################################################
+# Parse options
+###############################################################################
+
+while getopts ":w:s:r:d:t:h" opt; do
+    case "$opt" in
+        w) WPCLI="$OPTARG" ;;
+        s) WP_SUBDIR="$OPTARG" ;;
+        r) BACKUP_RETENTION_DAYS="$OPTARG" ;;
+        d) DATE_FORMAT="$OPTARG" ;;
+        t) TAR_BIN="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        :)
+            echo "Error: -$OPTARG requires an argument." >&2
+            usage
+            exit 1
+            ;;
+        \?)
+            echo "Error: Invalid option -$OPTARG" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+###############################################################################
+# Validate positional args
+###############################################################################
+
+if [[ $# -lt 2 ]]; then
+    echo "Error: Missing DOCROOT and BACKUP_DIR." >&2
+    usage
+    exit 1
+fi
+
+DOCROOT="$1"
+BASEBACKUP="${2%/}"
+
+###############################################################################
+# Validation
+###############################################################################
+
+# Check retention value is numeric
+if ! [[ "$BACKUP_RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+    echo "Error: Retention must be a positive integer." >&2
+    exit 1
+fi
+
+# Check docroot exists
+if [ ! -d "$DOCROOT" ]; then
+    echo "Error: Folder '$DOCROOT' does not exist." >&2
+    exit 1
+fi
+
+# Determine WordPress core directory
+if [ -n "$WP_SUBDIR" ]; then
+    WPDIR="${DOCROOT%/}/${WP_SUBDIR%/}/"
+else
+    WPDIR="${DOCROOT%/}/"
+fi
+
+if [ ! -d "$WPDIR" ]; then
+    echo "Error: WordPress directory '$WPDIR' does not exist." >&2
+    exit 1
+fi
+
+# Validate presence of wp-load.php (this is enough to bootstrap WP)
+if [ ! -f "${WPDIR%/}/wp-load.php" ]; then
+    echo "Error: '$WPDIR' does not contain wp-load.php. Not a valid WP core directory." >&2
+    exit 1
+fi
+
+# Ensure backup dir exists
+mkdir -p "$BASEBACKUP"
+
+DATE="$(date +"$DATE_FORMAT")"
+BACKUPDIR="$BASEBACKUP/$DATE"
+mkdir -p "$BACKUPDIR"
+
+###############################################################################
+# Backup operations
+###############################################################################
+
+# Verify WP checksums (non-fatal)
+if ! "$WPCLI" --path="$WPDIR" core verify-checksums; then
+    echo "Warning: core verify-checksums failed. Continuing." >&2
+fi
+
+# DB export
+DBFILE="$BACKUPDIR/$DATE.sql"
+if ! "$WPCLI" --path="$WPDIR" db export "$DBFILE" --add-drop-table; then
+    echo "Error: database export failed." >&2
+    exit 1
+fi
+
+# Metadata snapshots
+"$WPCLI" --path="$WPDIR" core version > "$BACKUPDIR/$DATE.core.txt"
+"$WPCLI" --path="$WPDIR" option get siteurl > "$BACKUPDIR/$DATE.siteurl.txt"
+
+"$WPCLI" --path="$WPDIR" theme list \
+    --fields=name,version \
+    --format=csv > "$BACKUPDIR/$DATE.themes.csv"
+
+"$WPCLI" --path="$WPDIR" plugin list \
+    --status=active,active-network,inactive \
+    --fields=name,version \
+    --format=csv > "$BACKUPDIR/$DATE.plugins.csv"
+
+# Remove CSV headers (portable)
+tail -n +2 "$BACKUPDIR/$DATE.themes.csv" > "$BACKUPDIR/$DATE.themes.tmp" \
+    && mv "$BACKUPDIR/$DATE.themes.tmp" "$BACKUPDIR/$DATE.themes.csv"
+
+tail -n +2 "$BACKUPDIR/$DATE.plugins.csv" > "$BACKUPDIR/$DATE.plugins.tmp" \
+    && mv "$BACKUPDIR/$DATE.plugins.tmp" "$BACKUPDIR/$DATE.plugins.csv"
+
+###############################################################################
+# Package snapshot
+###############################################################################
+
+cd "$BACKUPDIR"
+if "$TAR_BIN" -czf "$BASEBACKUP/$DATE.tar.gz" *; then
+    echo "Success: Created archive $BASEBACKUP/$DATE.tar.gz"
+    cd "$BASEBACKUP"
+    rm -rf "$BACKUPDIR"
+else
+    echo "Error: tar failed." >&2
+fi
+
+###############################################################################
+# Cleanup old archives
+###############################################################################
+
+cd "$BASEBACKUP"
+find . -type f -name '*.tar.gz' -mtime +"$BACKUP_RETENTION_DAYS" -delete
