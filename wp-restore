@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# Defaults (overridable by env, then by flags)
+###############################################################################
+
+: "${WPCLI:=/usr/local/bin/wp}"                   # Path to wp-cli
+: "${WP_SUBDIR:=wp}"                              # WP directory under DOCROOT ("" = in docroot)
+: "${WP_CONTENT_SUBDIR:=content}"              # WordPress content directory under DOCROOT
+: "${TAR_BIN:=/usr/bin/tar}"                      # Path to tar
+: "${GIT_BASE:=git@github.com:gerlandotermini}"   # Base git path for plugins/themes
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] DOCROOT BACKUP_TAR
+
+Restore a WordPress instance from a backup archive created by wp-backup.
+
+Options:
+  -w PATH    Path to wp-cli (default: $WPCLI)
+  -s NAME    WordPress subdirectory under DOCROOT (default: $WP_SUBDIR)
+             Use empty string if WP is directly in DOCROOT.
+  -c NAME    Content directory under DOCROOT (default: $WP_CONTENT_SUBDIR)
+             For example: wp-content
+  -t PATH    Path to tar binary (default: $TAR_BIN)
+  -g PATH    Base git path for plugins/themes (default: $GIT_BASE)
+             Plugin repo: PATH/wp-plugins-SLUG.git
+             Theme repo:  PATH/wp-themes-SLUG.git
+  -h         Show this help and exit
+
+Examples:
+  $(basename "$0") /var/www/html /var/backups/20250101.tar.gz
+  $(basename "$0") -s "" /var/www/html /var/backups/20250101.tar.gz
+EOF
+}
+
+###############################################################################
+# Parse options
+###############################################################################
+
+while getopts ":w:s:c:t:g:h" opt; do
+    case "$opt" in
+        w) WPCLI="$OPTARG" ;;
+        s) WP_SUBDIR="$OPTARG" ;;
+        c) WP_CONTENT_SUBDIR="$OPTARG" ;;
+        t) TAR_BIN="$OPTARG" ;;
+        g) GIT_BASE="$OPTARG" ;;
+        h)
+            usage
+            exit 0
+            ;;
+        :)
+            echo "Error: -$OPTARG requires an argument." >&2
+            usage
+            exit 1
+            ;;
+        \?)
+            echo "Error: invalid option -$OPTARG" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+###############################################################################
+# Positional args
+###############################################################################
+
+if [[ $# -lt 2 ]]; then
+    echo "Error: DOCROOT and BACKUP_TAR are required." >&2
+    usage
+    exit 1
+fi
+
+DOCROOT="$1"
+BACKUPFILEPATH="$2"
+
+###############################################################################
+# Basic validation
+###############################################################################
+
+if [ ! -d "$DOCROOT" ]; then
+    echo "Error: Document root '$DOCROOT' not found. Aborting." >&2
+    exit 1
+fi
+
+if [ ! -f "$BACKUPFILEPATH" ]; then
+    echo "Error: Backup file '$BACKUPFILEPATH' not found. Aborting." >&2
+    exit 1
+fi
+
+# Determine WordPress core directory (where wp-load.php lives)
+if [ -n "$WP_SUBDIR" ]; then
+    WPDIR="${DOCROOT%/}/${WP_SUBDIR%/}/"
+else
+    WPDIR="${DOCROOT%/}/"
+fi
+
+if [ ! -d "$WPDIR" ]; then
+    echo "Error: WordPress directory '$WPDIR' not found. Aborting." >&2
+    exit 1
+fi
+
+if [ ! -f "${WPDIR%/}/wp-load.php" ]; then
+    echo "Error: '$WPDIR' does not contain wp-load.php. Not a valid WP core directory." >&2
+    exit 1
+fi
+
+echo "Info: WordPress core detected in '$WPDIR'."
+
+CONTENTDIR="${DOCROOT%/}/${WP_CONTENT_SUBDIR%/}"
+
+# Derive backup base name (for files like 20250101.sql, .core.txt, etc.)
+BACKUPFILE_BASE="$(basename "$BACKUPFILEPATH")"
+BACKUPFILE="${BACKUPFILE_BASE%%.*}"
+
+###############################################################################
+# Unpack backup
+###############################################################################
+
+echo "Unpacking backup '$BACKUPFILEPATH' to /tmp..."
+"$TAR_BIN" xfz "$BACKUPFILEPATH" -C /tmp
+
+SITEURL_FILE="/tmp/${BACKUPFILE}.siteurl.txt"
+CORE_FILE="/tmp/${BACKUPFILE}.core.txt"
+SQL_FILE="/tmp/${BACKUPFILE}.sql"
+PLUGINS_CSV="/tmp/${BACKUPFILE}.plugins.csv"
+THEMES_CSV="/tmp/${BACKUPFILE}.themes.csv"
+
+# Sanity checks on required files
+if [ ! -f "$SITEURL_FILE" ]; then
+    echo "Incomplete backup file: missing $(basename "$SITEURL_FILE"). Aborting." >&2
+    exit 1
+fi
+
+if [ ! -f "$CORE_FILE" ]; then
+    echo "Incomplete backup file: missing $(basename "$CORE_FILE"). Aborting." >&2
+    exit 1
+fi
+
+if [ ! -f "$SQL_FILE" ]; then
+    echo "Incomplete backup file: missing $(basename "$SQL_FILE"). Aborting." >&2
+    exit 1
+fi
+
+###############################################################################
+# Compare URLs
+###############################################################################
+
+BACKUPSITEURL="$(<"$SITEURL_FILE")"
+CURRENTSITEURL="$("$WPCLI" option get siteurl --path="$WPDIR" --skip-plugins)"
+
+if [ "$BACKUPSITEURL" != "$CURRENTSITEURL" ]; then
+    echo "Error: Target URL '$CURRENTSITEURL' does not match backup URL '$BACKUPSITEURL'. Aborting." >&2
+    exit 1
+fi
+
+###############################################################################
+# Compare core versions
+###############################################################################
+
+BACKUPVERSION="$(<"$CORE_FILE")"
+CURRENTVERSION="$("$WPCLI" core version --path="$WPDIR" --skip-plugins)"
+
+cd "$DOCROOT"
+
+# If docroot has a git repo and WPDIR is tracked as submodule but missing, try to update
+if [ -d "$DOCROOT/.git" ] && [ ! -d "$WPDIR/.git" ]; then
+    echo "Attempting to restore WP core submodule into '$WPDIR'..."
+    /usr/bin/git --git-dir="$DOCROOT/.git" submodule update wp || \
+        echo "Warning: git submodule update failed; ensure core is in place manually." >&2
+fi
+
+if [ "$BACKUPVERSION" != "$CURRENTVERSION" ]; then
+    echo "Info: Current core version is $CURRENTVERSION, backup core version is $BACKUPVERSION."
+    echo "Note: You may want to switch your core git checkout to tag $BACKUPVERSION manually."
+    # Example (intentionally commented):
+    # /usr/bin/git --git-dir="$WPDIR/.git" --work-tree="$WPDIR" checkout -b "$BACKUPFILE-$BACKUPVERSION" "tags/$BACKUPVERSION"
+else
+    echo "wp/core: already at version $BACKUPVERSION"
+fi
+
+###############################################################################
+# Database restore
+###############################################################################
+
+read -r -n1 -p "Would you like to RESET the database and import data from the backup? [y/N] " RESET_DB
+echo
+if [[ "$RESET_DB" == "y" || "$RESET_DB" == "Y" ]]; then
+    echo "Resetting database..."
+    "$WPCLI" db reset --yes --path="$WPDIR"
+    echo "Importing SQL from '$SQL_FILE'..."
+    "$WPCLI" db import "$SQL_FILE" --path="$WPDIR"
+else
+    echo "Database not modified."
+fi
+
+###############################################################################
+# Restore plugins (git + wp-cli)
+###############################################################################
+
+if [ -f "$PLUGINS_CSV" ]; then
+    echo "Analyzing plugins from $(basename "$PLUGINS_CSV")"
+    while IFS=, read -r SLUG BACKUP_PLUG_VER; do
+        # Skip empty slug lines
+        [ -z "$SLUG" ] && continue
+
+        REPO="${GIT_BASE%/}/wp-plugins-${SLUG}.git"
+        PLUG_PATH="${CONTENTDIR}/plugins/$SLUG"
+
+        # Check remote repo
+        if git ls-remote --exit-code "$REPO" &>/dev/null; then
+
+            # Clone if missing and we have a version
+            if [[ ! -d "$PLUG_PATH" && -n "$BACKUP_PLUG_VER" ]]; then
+                echo "Restoring plugins/$SLUG from $REPO"
+                /usr/bin/git clone -b master "$REPO" "$PLUG_PATH"
+                /usr/bin/git --git-dir="$PLUG_PATH/.git" --work-tree="$PLUG_PATH" fetch --tags
+            fi
+
+            # Checkout the appropriate tag/version
+            if [ -n "$BACKUP_PLUG_VER" ]; then
+                CURRENT_PLUG_VER="$("$WPCLI" plugin get "$SLUG" --path="$WPDIR" --field=version --skip-plugins 2> /dev/null || echo "")"
+                if [ -n "$CURRENT_PLUG_VER" ] && [ "$BACKUP_PLUG_VER" != "$CURRENT_PLUG_VER" ]; then
+                    echo "Switching plugins/$SLUG to version $BACKUP_PLUG_VER"
+                    /usr/bin/git --git-dir="$PLUG_PATH/.git" --work-tree="$PLUG_PATH" checkout -b "$BACKUPFILE-$BACKUP_PLUG_VER" "tags/$BACKUP_PLUG_VER" || \
+                        echo "Warning: could not checkout tag $BACKUP_PLUG_VER for plugin $SLUG." >&2
+                elif [ -z "$CURRENT_PLUG_VER" ]; then
+                    echo "plugins/$SLUG: current version cannot be determined, keeping current files."
+                else
+                    echo "plugins/$SLUG: already at version $BACKUP_PLUG_VER"
+                fi
+            fi
+        else
+            echo "Remote repo not found for plugins/$SLUG ($REPO). Skipping."
+        fi
+    done < "$PLUGINS_CSV"
+else
+    echo "Warning: plugins CSV '$PLUGINS_CSV' not found. Skipping plugin git restore."
+fi
+
+###############################################################################
+# Restore themes (git + wp-cli)
+###############################################################################
+
+if [ -f "$THEMES_CSV" ]; then
+    echo "Analyzing themes from $(basename "$THEMES_CSV")"
+    while IFS=, read -r SLUG BACKUP_THEME_VER; do
+        [ -z "$SLUG" ] && continue
+
+        REPO="${GIT_BASE%/}/wp-themes-${SLUG}.git"
+        THEME_PATH="${CONTENTDIR}/themes/$SLUG"
+
+        if git ls-remote --exit-code "$REPO" &>/dev/null; then
+
+            # Clone if missing and we have a version
+            if [[ ! -d "$THEME_PATH" && -n "$BACKUP_THEME_VER" ]]; then
+                echo "Restoring themes/$SLUG from $REPO"
+                /usr/bin/git clone -b master "$REPO" "$THEME_PATH"
+                /usr/bin/git --git-dir="$THEME_PATH/.git" --work-tree="$THEME_PATH" fetch --tags
+            fi
+
+            # Checkout the appropriate tag/version
+            if [ -n "$BACKUP_THEME_VER" ]; then
+                CURRENT_THEME_VER="$("$WPCLI" theme get "$SLUG" --path="$WPDIR" --field=version --skip-plugins 2> /dev/null || echo "")"
+                if [ -n "$CURRENT_THEME_VER" ] && [ "$BACKUP_THEME_VER" != "$CURRENT_THEME_VER" ]; then
+                    echo "Switching themes/$SLUG to version $BACKUP_THEME_VER"
+                    /usr/bin/git --git-dir="$THEME_PATH/.git" --work-tree="$THEME_PATH" checkout -b "$BACKUPFILE-$BACKUP_THEME_VER" "tags/$BACKUP_THEME_VER" || \
+                        echo "Warning: could not checkout tag $BACKUP_THEME_VER for theme $SLUG." >&2
+                elif [ -z "$CURRENT_THEME_VER" ]; then
+                    echo "themes/$SLUG: current version cannot be determined, keeping current files."
+                else
+                    echo "themes/$SLUG: already at version $BACKUP_THEME_VER"
+                fi
+            fi
+        else
+            echo "Remote repo not found for themes/$SLUG ($REPO). Skipping."
+        fi
+    done < "$THEMES_CSV"
+else
+    echo "Warning: themes CSV '$THEMES_CSV' not found. Skipping theme git restore."
+fi
+
+###############################################################################
+# Cleanup
+###############################################################################
+
+echo "Cleaning up /tmp/${BACKUPFILE}*"
+rm -rf /tmp/"${BACKUPFILE}"*
+
+echo "Restore process completed."
