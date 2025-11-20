@@ -17,7 +17,7 @@ RETENTION_DAYS=30
 PATH_TO_SELF="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P)"
 
 # Load keywords
-IFS=$'\n' read -d '' -r -a KEYWORDS < "${PATH_TO_SELF}/keywords.txt" || true
+IFS=$'\n' read -d '' -r -a KEYWORDS < "${PATH_TO_SELF}/ip2ban-keywords.txt" || true
 
 ###########################################################################
 # Validate args

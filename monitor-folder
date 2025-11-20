@@ -1,0 +1,14 @@
+#!/bin/sh
+if [[ -z "$1" ]]; then
+    echo -e "Error: Please provide the path to the folder to monitor: monitor-uploads.sh /var/www/html/wp-content/uploads"
+    exit 1
+fi
+
+# Does the folder exist?
+if [ ! -d "$1" ]; then
+    echo "Error: Path $1 does not exist. Aborting."
+    exit 1
+fi
+
+find $1 ! \( -name "*.gif" -o -name "*.htm*" -o -name "*.jp*" -o -name "*.mp*" -o -name "*.pdf" -o -name "*.png" -o -name "*.srt" -o -name "*.txt" -o -name "*.webp" -o -name ".xls*" \) -not -type d -size +0b -exec ls -ldgG {} \; | awk '{if ($3 > 100) print $3 " " $7}'
+
