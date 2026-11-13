@@ -9,3 +9,6 @@
 
 # Local detection keywords
 ip2ban/ip2ban-keywords.txt
+
+# Python cache
+ip2ban/__pycache__/

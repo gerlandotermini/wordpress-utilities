@@ -1,125 +1,68 @@
 # ip2ban-forensics v1.0
 
-A read-only companion to `ip2ban.py` for behavioral analysis of Apache access logs. It extracts suspicious request patterns and supporting evidence so you can review activity by IP address or subnet.
+Read-only Apache access-log forensics for the existing ip2ban project.
 
-## Safety and scope
-
-- Reads the `logs` list and `lookback_minutes` value from the existing ip2ban `config.json`.
-- Understands Apache Combined Log Format and Common Log Format.
-- Does **not** modify `.htaccess`, ban IPs, or change ip2ban configuration.
-- Makes no external network or API calls.
-- Does not require an AI API key or any third-party Python packages.
-- Produces a terminal report or JSON output for later review.
-
-This is an indicator and triage tool, not an intrusion-detection guarantee. A detected pattern is not proof that the source is malicious. An HTTP 200 response is not proof that an exploit worked; WordPress rewrite rules can return a normal page for nonexistent paths.
+- Adds alert deduplication for `--findings-only` runs.
+- A finding is identified by subject (IP or subnet), finding category, and severity. Rolling-window request counts and evidence timestamps do not change its identity.
+- The same finding is suppressed for 24 hours by default. After the cooldown, it can alert again if it is still present.
+- A new finding category or severity for the same IP can alert immediately.
+- Alert state is stored in `ip2ban-forensics-alerts.json` beside the script by default and is written atomically.
+- Alert state does not change detection, `.htaccess`, or ip2ban thresholds.
+- `--alert-state` selects a different state-file path; `--alert-cooldown-hours` changes the cooldown.
+- Findings-only output highlights HTTP 2xx responses for review, without treating them as proof of exposure or compromise.
+- Denied `/xmlrpc.php` and `/wp-login.php` requests no longer produce duplicate overlapping findings.
 
 ## Installation
 
-Copy `ip2ban-forensics-v1.0.py` into the same directory as your existing `ip2ban.py` and `config.json`. For example:
+Back up your current script, then upload v1.0 as `ip2ban-forensics.py` in the same directory as `ip2ban.py` and `config.json`.
 
 ```bash
-cd ~/wp-utils/ip2ban
-chmod 750 ip2ban-forensics-v1.0.py
-python3 ip2ban-forensics-v1.0.py --help
+cd /home/duechiac/wp-utils/ip2ban
+cp -p ip2ban-forensics.py ip2ban-forensics.py.v1.3.bak
+# Upload v1.0 as ip2ban-forensics.py
+chmod 755 ip2ban-forensics.py
+python3 -m py_compile ip2ban-forensics.py
+python3 ip2ban-forensics.py --help
 ```
 
-The script uses `config.json` beside itself by default. It only needs the `logs` and `lookback_minutes` settings; it ignores the `.htaccess` and keyword settings. If your config file is elsewhere, specify it with `--config /path/to/config.json`.
+## Test findings-only output
 
-## Running an analysis
-
-Run with the configured `lookback_minutes` window (currently 60 minutes):
+Preview all current findings without changing the alert state:
 
 ```bash
-python3 ip2ban-forensics-v1.0.py
+python3 ip2ban-forensics.py --minutes 60 --findings-only
 ```
 
-Analyze the last 24 hours:
+The first deduplicated run reports currently active findings and creates the alert-state file:
 
 ```bash
-python3 ip2ban-forensics-v1.0.py --hours 24
+python3 ip2ban-forensics.py --minutes 60 --findings-only --deduplicate-alerts
 ```
 
-Investigate one IP address:
+Subsequent runs suppress the same IP/category/severity or subnet/category/severity until its cooldown expires.
 
-```bash
-python3 ip2ban-forensics-v1.0.py --ip 34.174.75.20
+## Recommended hourly cron
+
+Run at 17 minutes past every hour, analyze the previous 60 minutes, and email only newly eligible findings or script errors:
+
+```cron
+17 * * * * tmp=$(mktemp) || exit 1; /usr/bin/python3 /home/duechiac/wp-utils/ip2ban/ip2ban-forensics.py --minutes 60 --findings-only --deduplicate-alerts --alert-cooldown-hours 24 > "$tmp" 2>&1; status=$?; if [ -s "$tmp" ]; then cat "$tmp"; fi; rm -f "$tmp"; exit "$status"
 ```
 
-Investigate an entire subnet:
+Ensure the hosting account has a valid cron email destination configured. The alert-state JSON file is runtime data and should remain private/untracked. The existing `*.json` Git ignore rule excludes it.
 
-```bash
-python3 ip2ban-forensics-v1.0.py --network 188.241.38.0/24
-```
+## Command-line options
 
-Analyze the last 7 days for one subnet:
+- `--findings-only`: print only IP/subnet findings; produce no standard output when there are none.
+- `--deduplicate-alerts`: suppress findings already alerted within the cooldown. Requires `--findings-only`.
+- `--alert-state PATH`: choose the persistent alert-state JSON file. Default: `ip2ban-forensics-alerts.json` beside the script.
+- `--alert-cooldown-hours N`: re-alert for the same finding after N hours. Default: `24`.
+- `--verify-crawlers`: manually verify crawler claims using bounded DNS checks and official IP ranges. Omitted from the hourly cron job to avoid unnecessary DNS work.
 
-```bash
-python3 ip2ban-forensics-v1.0.py --network 188.241.38.0/24 --hours 168
-```
+## Safety and behavior notes
 
-Save a machine-readable report as JSON:
-
-```bash
-python3 ip2ban-forensics-v1.0.py --hours 24 --json > forensics-24h.json
-```
-
-Adjust the request-burst and repeated-login thresholds for a particular run:
-
-```bash
-python3 ip2ban-forensics-v1.0.py --burst-threshold 60 --login-threshold 8
-```
-
-These command-line thresholds affect forensic reporting only; they do not change ip2ban's ban thresholds.
-
-## Detection rules in v1.0
-
-The analyzer looks for indicators including:
-
-- Requests for sensitive files and common backup/configuration artifacts.
-- Path traversal syntax.
-- SQL-injection-like request parameters.
-- Command-injection-like syntax.
-- Cross-site-scripting-like syntax.
-- WordPress author/REST user enumeration.
-- Common administrative, diagnostic, and software-probe paths.
-- WordPress login and XML-RPC activity, including repeated POST requests.
-- Unusual HTTP methods and potentially mutating methods.
-- Multiple alternative CMS installation paths within a 10-minute window.
-- Repeated login/XML-RPC POST requests within a 10-minute window.
-- High per-IP request bursts within one minute.
-- Broad sweeps of distinct paths returning 4xx/5xx responses.
-- Aggregated request volume by IPv4 `/24` and IPv6 `/64` subnet.
-- Crawler names claimed in User-Agent strings. These are reported as claims only; v1.0 does not verify crawler identity.
-
-Subnet grouping is a traffic-aggregation convenience, not proof that the addresses share an owner or operator. The default burst threshold is 60 requests per minute; the repeated authentication POST threshold is 8 in 10 minutes. These are forensic triage defaults, not ip2ban ban thresholds.
-
-## Interpreting the report
-
-- **Severity** describes the type of indicator, not proof of impact.
-- **Confidence** describes confidence in the pattern match, not confidence that the server was compromised.
-- **Outcome indicators** help distinguish not-found/denied responses from successful HTTP status codes that deserve closer validation.
-- `potentially_successful` means a sensitive-file request received a 2xx response. Check whether the requested resource actually existed and what Apache served before concluding it was exposed.
-- Common secret query-parameter values (such as password, token, key, and nonce) are redacted in evidence output. The original access logs are not modified.
-
-## Limitations
-
-- Access logs show requests and HTTP responses, not what happened inside PHP or the database.
-- The tool cannot reliably identify the person behind an IP address.
-- A 200 response may be a WordPress soft-404 or rewrite fallback.
-- v1.0 does not inspect Apache error logs, WordPress audit logs, filesystem changes, or database changes.
-- A crawler User-Agent is not authentication. A client can spoof a Googlebot, ClaudeBot, or other crawler name; v1.0 does not verify those claims using DNS or official IP ranges.
-- v1.0 uses deterministic local rules only. AI interpretation is intentionally deferred until the evidence extraction has been reviewed against real traffic.
-
-## Suggested first run
-
-Start with a 24-hour report and review the findings before changing any detection thresholds or taking action against an IP:
-
-```bash
-python3 ip2ban-forensics-v1.0.py --hours 24
-```
-
-You can also save the same report as JSON if you want to share or process the structured evidence:
-
-```bash
-python3 ip2ban-forensics-v1.0.py --hours 24 --json > forensics-24h.json
-```
+- The script is read-only: it does not edit `.htaccess`, ban IPs, or change ip2ban thresholds/configuration.
+- Existing whitelist behavior and detection thresholds are unchanged.
+- A 2xx response is highlighted for review; it does not by itself prove that a resource was exposed or that a compromise occurred.
+- Findings are indicators for review, not proof of compromise.
+- The first deduplicated run may email findings already present in the selected analysis window because no alert history exists yet.

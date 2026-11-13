@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ip2ban v2.3: Apache access-log analysis and managed .htaccess bans."""
+"""ip2ban v2.0: Apache access-log analysis and managed .htaccess bans."""
 import argparse
 import collections
 import datetime as dt
@@ -388,7 +388,7 @@ def http_json(url):
         url,
         headers={
             'Accept': 'application/rdap+json, application/json',
-            'User-Agent': 'ip2ban/2.3 (Apache access-log reporting)',
+            'User-Agent': 'ip2ban/2.0 (Apache access-log reporting)',
         },
     )
     with urlopen(request, timeout=IP_LOOKUP_TIMEOUT) as response:
