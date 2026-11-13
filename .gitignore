@@ -1,2 +1,3 @@
 *.gz
+*.log
 ip2ban-keywords.txt
