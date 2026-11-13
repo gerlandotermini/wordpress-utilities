@@ -12,12 +12,34 @@ THRESHOLD_4XX_5XX=30
 THRESHOLD_KEYWORDS=5
 THRESHOLD_DOS=10000
 LOOKBACK_MINUTES=60
-RETENTION_DAYS=30
+RETENTION_DAYS=45
+LOG_EXTRACT_LINES=20
 
 PATH_TO_SELF="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P)"
 
 # Load keywords
 IFS=$'\n' read -d '' -r -a KEYWORDS < "${PATH_TO_SELF}/ip2ban-keywords.txt" || true
+
+###########################################################################
+# Apache log timestamp filtering
+###########################################################################
+
+APACHE_DATE_AWK='
+function timestamp(s, a, months, m) {
+    split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", months, " ")
+    split(s, a, /[\/:\[]/)
+
+    for (m = 1; m <= 12; m++)
+        if (a[3] == months[m])
+            break
+
+    if (m > 12) return 0
+
+    return sprintf("%04d%02d%02d%02d%02d%02d",
+               a[4], m, a[2], a[5], a[6], a[7]) + 0
+}
+'
+CUTOFF_DATE=$(date -d "${LOOKBACK_MINUTES} minutes ago" +%Y%m%d%H%M%S)
 
 ###########################################################################
 # Validate args
@@ -48,30 +70,39 @@ ORIG_OWNER=$(stat -c '%u:%g' "$HTACCESS")
 ###########################################################################
 
 function in_subnet {
-    local ip ip_a mask netmask sub sub_ip rval start end
-    local readonly BITMASK=0xFFFFFFFF
+    python3 - "$1" "$2" <<'PY'
+import ipaddress
+import sys
 
-    [[ "${DEBUG:-}" == "" ]] && DEBUG=0
+try:
+    subnet = ipaddress.ip_network(sys.argv[1], strict=False)
+    ip = ipaddress.ip_address(sys.argv[2])
+    print(1 if ip in subnet else 0)
+except ValueError:
+    print(0)
+PY
+}
 
-    IFS=/ read sub mask <<< "$1"
-    IFS=. read -a sub_ip <<< "$sub"
-    IFS=. read -a ip_a <<< "$2"
+###########################################################################
+# Helper: print access log extract (method + URL only)
+###########################################################################
 
-    [[ -z "$mask" ]] && mask=32
+print_log_extract() {
+    local ip="$1"
+    local logfile="$2"
 
-    netmask=$(($BITMASK<<$((32-mask)) & $BITMASK))
+    echo "---- Access log extract for $ip ($logfile) ----"
 
-    start=0
-    for o in "${sub_ip[@]}"; do start=$((start<<8 | o)); done
-    start=$(( start & netmask ))
-    end=$(( start | ~netmask & BITMASK ))
+    awk -v ip="$ip" \
+        -v cutoff="$CUTOFF_DATE" \
+        "$APACHE_DATE_AWK"'
+        $1 == ip && timestamp($4) > cutoff {
+            gsub(/"/, "", $6)
+            print $6, $7
+        }' "$logfile" | tail -n "$LOG_EXTRACT_LINES"
 
-    ip=0
-    for o in "${ip_a[@]}"; do ip=$((ip<<8 | o)); done
-
-    (( ip >= start && ip <= end )) && rval=1 || rval=0
-
-    echo "$rval"
+    echo "---- End extract ----"
+    echo
 }
 
 ###########################################################################
@@ -88,10 +119,8 @@ prune_old_bans() {
     tmp_filtered=$(mktemp)
     tmp_ht=$(mktemp)
 
-    # Extract block
     awk '/BEGIN ip2ban-bans/{f=1;next} /END ip2ban-bans/{f=0} f' "$HTACCESS" > "$tmp_bans"
 
-    # Iterate over ban entries
     while IFS= read -r line; do
         if [[ "$line" =~ ^#\ ([0-9]{4}-[0-9]{2}-[0-9]{2})\ ([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
             dt="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
@@ -107,7 +136,6 @@ prune_old_bans() {
         fi
     done < "$tmp_bans"
 
-    # Rebuild file with pruned block
     awk -v bans_file="$tmp_filtered" '
         /BEGIN ip2ban-bans/ {
             print
@@ -123,7 +151,6 @@ prune_old_bans() {
         { if (!inblock) print }
     ' "$HTACCESS" > "$tmp_ht" && mv "$tmp_ht" "$HTACCESS"
 
-    # Restore perms
     chown "$ORIG_OWNER" "$HTACCESS" 2>/dev/null || true
     chmod "$ORIG_MODE" "$HTACCESS" 2>/dev/null || true
 
@@ -139,30 +166,69 @@ BANLIST=""
 for server_log in "${LOGS[@]}"; do
     [ ! -f "$server_log" ] && continue
 
-    # 1) 4xx/5xx errors
-    NEWITEMS=$(awk -v datestring="$(date -d "now -${LOOKBACK_MINUTES} minutes" +[%d/%b/%Y:%H:%M:%S)" \
-                    '{if ($4 > datestring && ($9 ~ /^4/ || $9 ~ /^5/)) print $1, $9}' \
-                    "$server_log" \
-               | sort | uniq -c | sort -nr \
-               | awk -v t="$THRESHOLD_4XX_5XX" -v m="$LOOKBACK_MINUTES" '{ if ($1 > t) print $2 "|" $3" HTTP errors: "$1" in last "m" minutes" }')
+    #######################################################################
+    # 1) 4xx / 5xx errors (include status code)
+    #######################################################################
+
+    NEWITEMS=$(awk -v cutoff="$CUTOFF_DATE" \
+        "$APACHE_DATE_AWK"'
+        timestamp($4) > cutoff && ($9 ~ /^4/ || $9 ~ /^5/) {
+            print $1, $9
+        }' "$server_log" \
+        | sort | uniq -c | sort -nr \
+        | awk -v t="$THRESHOLD_4XX_5XX" \
+            -v m="$LOOKBACK_MINUTES" \
+            -v logfile="$server_log" '
+            $1 > t {
+                print $2"|HTTP "$3" errors: "$1" in the last "m" minutes|"logfile
+            }')
 
     [ -n "$NEWITEMS" ] && BANLIST+="$NEWITEMS"$'\n'
 
-    # 2) Suspicious URLs
-    NEWITEMS=$(awk -v datestring="$(date -d "now -${LOOKBACK_MINUTES} minutes" +[%d/%b/%Y:%H:%M:%S)" \
-                    '{if ($4 > datestring) print $0}' "$server_log" \
-               | awk -v keywords="${KEYWORDS[*]}" \
-                     '{split(keywords,kw," "); for (x in kw) if ($7 ~ kw[x]) print $1, kw[x]}' \
-               | sort | uniq -c | sort -nr \
-               | awk -v t="$THRESHOLD_KEYWORDS" -v m="$LOOKBACK_MINUTES" '{ if ($1 > t) print $2"|Keyword "$3" seen "$1" times in last "m" minutes" }')
+    #######################################################################
+    # 2) Suspicious URLs / keywords
+    #######################################################################
+
+    NEWITEMS=$(awk -v cutoff="$CUTOFF_DATE" \
+        "$APACHE_DATE_AWK"'
+        timestamp($4) > cutoff {
+            print $0
+        }' "$server_log" \
+        | awk -v keywords="${KEYWORDS[*]}" \
+            '{
+                n = split(keywords, kw, " ")
+                for (x = 1; x <= n; x++)
+                    if (kw[x] != "" && $7 ~ kw[x]) {
+                        print $1
+                        break
+                    }
+            }' \
+        | sort | uniq -c | sort -nr \
+        | awk -v t="$THRESHOLD_KEYWORDS" \
+            -v m="$LOOKBACK_MINUTES" \
+            -v logfile="$server_log" '
+            $1 > t {
+                print $2"|Keyword abuse: "$1" hits in the last "m" minutes|"logfile
+            }')
 
     [ -n "$NEWITEMS" ] && BANLIST+="$NEWITEMS"$'\n'
 
+    #######################################################################
     # 3) DoS behavior
-    NEWITEMS=$(awk -v datestring="$(date -d "now -${LOOKBACK_MINUTES} minutes" +[%d/%b/%Y:%H:%M:%S)" \
-                    '{if ($4 > datestring) print $1}' "$server_log" \
-               | sort | uniq -c | sort -nr \
-               | awk -v t="$THRESHOLD_DOS" -v m="$LOOKBACK_MINUTES" '{ if ($1 > t) print $2"|DoS: "$1" req in last "m" minutes" }')
+    #######################################################################
+
+    NEWITEMS=$(awk -v cutoff="$CUTOFF_DATE" \
+        "$APACHE_DATE_AWK"'
+        timestamp($4) > cutoff {
+            print $1
+        }' "$server_log" \
+        | sort | uniq -c | sort -nr \
+        | awk -v t="$THRESHOLD_DOS" \
+            -v m="$LOOKBACK_MINUTES" \
+            -v logfile="$server_log" '
+            $1 > t {
+                print $2"|DoS: "$1" req in the last "m" minutes|"logfile
+            }')
 
     [ -n "$NEWITEMS" ] && BANLIST+="$NEWITEMS"$'\n'
 done
@@ -172,7 +238,7 @@ done
 ###########################################################################
 
 WHITELIST=$(awk '/BEGIN ip2ban-whitelist/{f=1;next} /END ip2ban-whitelist/{f=0} f' "$HTACCESS" \
-             | sed 's/^# *//' | awk '{print $1}')
+    | sed 's/^# *//' | awk '{print $1}')
 
 ###########################################################################
 # First prune old bans
@@ -185,10 +251,9 @@ prune_old_bans
 ###########################################################################
 
 if [ -n "$BANLIST" ]; then
-    while IFS="|" read -r ip comment; do
+    while IFS="|" read -r ip comment source_log; do
         [ -z "$ip" ] && continue
 
-        # Check whitelist
         WHITED=0
         for subnet in $WHITELIST; do
             if [[ $(in_subnet "$subnet" "$ip") -eq 1 ]]; then
@@ -198,12 +263,11 @@ if [ -n "$BANLIST" ]; then
         done
         [ $WHITED -eq 1 ] && continue
 
-        # Skip if already banned
-        if awk '/BEGIN ip2ban-bans/{f=1;next} /END ip2ban-bans/{f=0} f' "$HTACCESS" | grep -Fq "Deny from $ip"; then
+        if awk '/BEGIN ip2ban-bans/{f=1;next} /END ip2ban-bans/{f=0} f' "$HTACCESS" \
+            | grep -Fq "Deny from $ip"; then
             continue
         fi
 
-        # Build ban entry
         IPHOSTNAME=$(nslookup "$ip" 2>/dev/null | awk '/name / {gsub(/.$/,""); print " ["$NF"]"; exit}')
         BAN_COMMENT="# $(date +'%Y-%m-%d %H:%M:%S')${IPHOSTNAME} - $comment"
         BAN_RULE="Deny from $ip"
@@ -219,11 +283,14 @@ if [ -n "$BANLIST" ]; then
             { print }
         ' "$HTACCESS" > "$tmpfile" && mv "$tmpfile" "$HTACCESS"
 
-        # Restore perms
         chown "$ORIG_OWNER" "$HTACCESS" 2>/dev/null || true
         chmod "$ORIG_MODE" "$HTACCESS" 2>/dev/null || true
 
         echo "Added: $ip $IPHOSTNAME - $comment"
+
+        if [ -n "$source_log" ] && [ -f "$source_log" ]; then
+            print_log_extract "$ip" "$source_log"
+        fi
 
     done <<< "$BANLIST"
 fi

@@ -10,6 +10,7 @@ set -euo pipefail
 : "${BACKUP_RETENTION_DAYS:=180}"        # Keep .tar.gz backups for N days
 : "${DATE_FORMAT:=%Y%m%d}"               # Format for backup names
 : "${TAR_BIN:=/usr/bin/tar}"             # Path to tar
+PHP_CLI="/usr/local/bin/php"             # Force WP-CLI to run with CLI PHP
 
 usage() {
     cat <<EOF
@@ -116,26 +117,26 @@ mkdir -p "$BACKUPDIR"
 ###############################################################################
 
 # Verify WP checksums (non-fatal)
-if ! "$WPCLI" --path="$WPDIR" core verify-checksums; then
+if ! $PHP_CLI "$WPCLI" --path="$WPDIR" core verify-checksums; then
     echo "Warning: core verify-checksums failed. Continuing." >&2
 fi
 
 # DB export
 DBFILE="$BACKUPDIR/$DATE.sql"
-if ! "$WPCLI" --path="$WPDIR" db export "$DBFILE" --add-drop-table; then
+if ! $PHP_CLI "$WPCLI" --path="$WPDIR" db export "$DBFILE" --add-drop-table; then
     echo "Error: database export failed." >&2
     exit 1
 fi
 
 # Metadata snapshots
-"$WPCLI" --path="$WPDIR" core version > "$BACKUPDIR/$DATE.core.txt"
-"$WPCLI" --path="$WPDIR" option get siteurl > "$BACKUPDIR/$DATE.siteurl.txt"
+$PHP_CLI "$WPCLI" --path="$WPDIR" core version > "$BACKUPDIR/$DATE.core.txt"
+$PHP_CLI "$WPCLI" --path="$WPDIR" option get siteurl > "$BACKUPDIR/$DATE.siteurl.txt"
 
-"$WPCLI" --path="$WPDIR" theme list \
+$PHP_CLI "$WPCLI" --path="$WPDIR" theme list \
     --fields=name,version \
     --format=csv > "$BACKUPDIR/$DATE.themes.csv"
 
-"$WPCLI" --path="$WPDIR" plugin list \
+$PHP_CLI "$WPCLI" --path="$WPDIR" plugin list \
     --status=active,active-network,inactive \
     --fields=name,version \
     --format=csv > "$BACKUPDIR/$DATE.plugins.csv"
