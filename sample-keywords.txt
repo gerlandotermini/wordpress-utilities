@@ -1,3 +1,0 @@
-xmlrpc
-^/wp-login.php
-wp-signup
