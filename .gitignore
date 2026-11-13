@@ -1,3 +1,11 @@
+# Archives
 *.gz
+
+# Logs
 *.log
-ip2ban-keywords.txt
+
+# JSON configuration and runtime data
+*.json
+
+# Local detection keywords
+ip2ban/ip2ban-keywords.txt
