@@ -6,6 +6,7 @@
 
 # JSON configuration and runtime data
 *.json
+!config-sample.json
 
 # Local detection keywords
 ip2ban/ip2ban-keywords.txt

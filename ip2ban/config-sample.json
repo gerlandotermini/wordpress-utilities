@@ -1,0 +1,13 @@
+{
+  "htaccess": "/path/to/your/.htaccess",
+  "logs": [
+    "/path/to/your/access-logs"
+  ],
+  "keywords_file": "/path/to/your/keywords.txt",
+  "threshold_errors": 30,
+  "threshold_keywords": 5,
+  "threshold_dos": 10000,
+  "lookback_minutes": 60,
+  "retention_days": 45,
+  "log_extract_lines": 20
+}
